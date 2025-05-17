@@ -1,414 +1,632 @@
-# A Minimal Rust Kernel
-**Feb 10, 2018**
+# VGA Text Mode
+Feb 26, 2018
 
-In this post, we create a minimal 64-bit Rust kernel for the x86 architecture. We build upon the freestanding Rust binary from the previous post to create a bootable disk image that prints something to the screen.
+The VGA text mode is a simple way to print text to the screen. In this post, we create an interface that makes its usage safe and simple by encapsulating all unsafety in a separate module. We also implement support for Rust’s formatting macros.
 
-This blog is openly developed on [GitHub](https://github.com/phil-opp/blog_os). If you have any problems or questions, please open an issue there. You can also leave comments at the bottom. The complete source code for this post can be found in the `post-02` branch.
+This blog is openly developed on **GitHub**. If you have any problems or questions, please open an issue there. You can also leave comments at the bottom. The complete source code for this post can be found in the `post-03` branch.
 
-## 🔗 The Boot Process
+## The VGA Text Buffer
+To print a character to the screen in VGA text mode, one has to write it to the text buffer of the VGA hardware. The VGA text buffer is a two-dimensional array with typically 25 rows and 80 columns, which is directly rendered to the screen. Each array entry describes a single screen character through the following format:
 
-When you turn on a computer, it begins executing firmware code that is stored in motherboard ROM. This code performs a power-on self-test, detects available RAM, and pre-initializes the CPU and hardware. Afterwards, it looks for a bootable disk and starts booting the operating system kernel.
+| Bit(s) | Value            |
+| :----- | :--------------- |
+| 0-7    | ASCII code point |
+| 8-11   | Foreground color |
+| 12-14  | Background color |
+| 15     | Blink            |
 
-On x86, there are two firmware standards: the “Basic Input/Output System“ (BIOS) and the newer “Unified Extensible Firmware Interface” (UEFI). The BIOS standard is old and outdated, but simple and well-supported on any x86 machine since the 1980s. UEFI, in contrast, is more modern and has much more features, but is more complex to set up (at least in my opinion).
+The first byte represents the character that should be printed in the ASCII encoding. To be more specific, it isn’t exactly ASCII, but a character set named code page 437 with some additional characters and slight modifications. For simplicity, we will proceed to call it an ASCII character in this post.
 
-Currently, we only provide BIOS support, but support for UEFI is planned, too. If you’d like to help us with this, check out the [Github issue](https://github.com/phil-opp/blog_os/issues/348).
+The second byte defines how the character is displayed. The first four bits define the foreground color, the next three bits the background color, and the last bit whether the character should blink. The following colors are available:
 
-### 🔗 BIOS Boot
+| Number | Color      | Number + Bright Bit | Bright Color |
+| :----- | :--------- | :------------------ | :----------- |
+| 0x0    | Black      | 0x8                 | Dark Gray    |
+| 0x1    | Blue       | 0x9                 | Light Blue   |
+| 0x2    | Green      | 0xa                 | Light Green  |
+| 0x3    | Cyan       | 0xb                 | Light Cyan   |
+| 0x4    | Red        | 0xc                 | Light Red    |
+| 0x5    | Magenta    | 0xd                 | Pink         |
+| 0x6    | Brown      | 0xe                 | Yellow       |
+| 0x7    | Light Gray | 0xf                 | White        |
 
-Almost all x86 systems have support for BIOS booting, including newer UEFI-based machines that use an emulated BIOS. This is great, because you can use the same boot logic across all machines from the last century. But this wide compatibility is at the same time the biggest disadvantage of BIOS booting, because it means that the CPU is put into a 16-bit compatibility mode called real mode before booting so that archaic bootloaders from the 1980s would still work.
+Bit 4 is the bright bit, which turns, for example, blue into light blue. For the background color, this bit is repurposed as the blink bit.
 
-But let’s start from the beginning:
+The VGA text buffer is accessible via memory-mapped I/O to the address `0xb8000`. This means that reads and writes to that address don’t access the RAM but directly access the text buffer on the VGA hardware. This means we can read and write it through normal memory operations to that address.
 
-When you turn on a computer, it loads the BIOS from some special flash memory located on the motherboard. The BIOS runs self-test and initialization routines of the hardware, then it looks for bootable disks. If it finds one, control is transferred to its bootloader, which is a 512-byte portion of executable code stored at the disk’s beginning. Most bootloaders are larger than 512 bytes, so bootloaders are commonly split into a small first stage, which fits into 512 bytes, and a second stage, which is subsequently loaded by the first stage.
+Note that memory-mapped hardware might not support all normal RAM operations. For example, a device could only support byte-wise reads and return junk when a `u64` is read. Fortunately, the text buffer supports normal reads and writes, so we don’t have to treat it in a special way.
 
-The bootloader has to determine the location of the kernel image on the disk and load it into memory. It also needs to switch the CPU from the 16-bit real mode first to the 32-bit protected mode, and then to the 64-bit long mode, where 64-bit registers and the complete main memory are available. Its third job is to query certain information (such as a memory map) from the BIOS and pass it to the OS kernel.
+## A Rust Module
+Now that we know how the VGA buffer works, we can create a Rust module to handle printing:
 
-Writing a bootloader is a bit cumbersome as it requires assembly language and a lot of non insightful steps like “write this magic value to this processor register”. Therefore, we don’t cover bootloader creation in this post and instead provide a tool named `bootimage` that automatically prepends a bootloader to your kernel.
-
-If you are interested in building your own bootloader: Stay tuned, a set of posts on this topic is already planned!
-
-### 🔗 The Multiboot Standard
-
-To avoid that every operating system implements its own bootloader, which is only compatible with a single OS, the Free Software Foundation created an open bootloader standard called Multiboot in 1995. The standard defines an interface between the bootloader and the operating system, so that any Multiboot-compliant bootloader can load any Multiboot-compliant operating system. The reference implementation is GNU GRUB, which is the most popular bootloader for Linux systems.
-
-To make a kernel Multiboot compliant, one just needs to insert a so-called Multiboot header at the beginning of the kernel file. This makes it very easy to boot an OS from GRUB. However, GRUB and the Multiboot standard have some problems too:
-
-* They support only the 32-bit protected mode. This means that you still have to do the CPU configuration to switch to the 64-bit long mode.
-* They are designed to make the bootloader simple instead of the kernel. For example, the kernel needs to be linked with an adjusted default page size, because GRUB can’t find the Multiboot header otherwise. Another example is that the boot information, which is passed to the kernel, contains lots of architecture-dependent structures instead of providing clean abstractions.
-* Both GRUB and the Multiboot standard are only sparsely documented.
-* GRUB needs to be installed on the host system to create a bootable disk image from the kernel file. This makes development on Windows or Mac more difficult.
-
-Because of these drawbacks, we decided to not use GRUB or the Multiboot standard. However, we plan to add Multiboot support to our `bootimage` tool, so that it’s possible to load your kernel on a GRUB system too. If you’re interested in writing a Multiboot compliant kernel, check out the [first edition of this blog series](https://os.phil-opp.com/first-edition/multiboot-kernel/).
-
-### 🔗 UEFI
-
-(We don’t provide UEFI support at the moment, but we would love to! If you’d like to help, please tell us in the [Github issue](https://github.com/phil-opp/blog_os/issues/348).)
-
-## 🔗 A Minimal Kernel
-
-Now that we roughly know how a computer boots, it’s time to create our own minimal kernel. Our goal is to create a disk image that prints a “Hello World!” to the screen when booted. We do this by extending the previous post’s freestanding Rust binary.
-
-As you may remember, we built the freestanding binary through `cargo`, but depending on the operating system, we needed different entry point names and compile flags. That’s because `cargo` builds for the host system by default, i.e., the system you’re running on. This isn’t something we want for our kernel, because a kernel that runs on top of, e.g., Windows, does not make much sense. Instead, we want to compile for a clearly defined target system.
-
-### 🔗 Installing Rust Nightly
-
-Rust has three release channels: stable, beta, and nightly. The [Rust Book explains the difference between these channels really well](https://doc.rust-lang.org/book/appendix-07-nightly-rust.html), so take a minute and check it out. For building an operating system, we will need some experimental features that are only available on the nightly channel, so we need to install a nightly version of Rust.
-
-To manage Rust installations, I highly recommend `rustup`. It allows you to install nightly, beta, and stable compilers side-by-side and makes it easy to update them. With `rustup`, you can use a nightly compiler for the current directory by running `rustup override set nightly`. Alternatively, you can add a file called `rust-toolchain` with the content `nightly` to the project’s root directory. You can check that you have a nightly version installed by running `rustc --version`: The version number should contain `-nightly` at the end.
-
-The nightly compiler allows us to opt-in to various experimental features by using so-called feature flags at the top of our file. For example, we could enable the experimental `asm!` macro for inline assembly by adding `#![feature(asm)]` to the top of our `main.rs`. Note that such experimental features are completely unstable, which means that future Rust versions might change or remove them without prior warning. For this reason, we will only use them if absolutely necessary.
-
-### 🔗 Target Specification
-
-Cargo supports different target systems through the `--target` parameter. The target is described by a so-called target triple, which describes the CPU architecture, the vendor, the operating system, and the ABI. For example, the `x86_64-unknown-linux-gnu` target triple describes a system with an `x86_64` CPU, no clear vendor, and a Linux operating system with the GNU ABI. Rust supports many different target triples, including `arm-linux-androideabi` for Android or `wasm32-unknown-unknown` for WebAssembly.
-
-For our target system, however, we require some special configuration parameters (e.g. no underlying OS), so none of the existing target triples fits. Fortunately, Rust allows us to define our own target through a JSON file. For example, a JSON file that describes the `x86_64-unknown-linux-gnu` target looks like this:
-
-```json
-{
-  "llvm-target": "x86_64-unknown-linux-gnu",
-  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
-  "arch": "x86_64",
-  "target-endian": "little",
-  "target-pointer-width": "64",
-  "target-c-int-width": "32",
-  "os": "linux",
-  "executables": true,
-  "linker-flavor": "gcc",
-  "pre-link-args": ["-m64"],
-  "morestack": false
-}
+```rust
+// in src/main.rs
+mod vga_buffer;
 ````
 
-Most fields are required by LLVM to generate code for that platform. For example, the `data-layout` field defines the size of various integer, floating point, and pointer types. Then there are fields that Rust uses for conditional compilation, such as `target-pointer-width`. The third kind of field defines how the crate should be built. For example, the `pre-link-args` field specifies arguments passed to the linker.
+For the content of this module, we create a new `src/vga_buffer.rs` file. All of the code below goes into our new module (unless specified otherwise).
 
-We also target `x86_64` systems with our kernel, so our target specification will look very similar to the one above. Let’s start by creating an `x86_64-blog_os.json` file (choose any name you like) with the common content:
+### Colors
 
-```json
-{
-  "llvm-target": "x86_64-unknown-none",
-  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
-  "arch": "x86_64",
-  "target-endian": "little",
-  "target-pointer-width": "64",
-  "target-c-int-width": "32",
-  "os": "none",
-  "executables": true
-}
-```
-
-Note that we changed the OS in the `llvm-target` and the `os` field to `none`, because we will run on bare metal.
-
-We add the following build-related entries:
-
-```json
-  "linker-flavor": "ld.lld",
-  "linker": "rust-lld",
-```
-
-Instead of using the platform’s default linker (which might not support Linux targets), we use the cross-platform LLD linker that is shipped with Rust for linking our kernel.
-
-```json
-  "panic-strategy": "abort",
-```
-
-This setting specifies that the target doesn’t support stack unwinding on panic, so instead the program should abort directly. This has the same effect as the `panic = "abort"` option in our `Cargo.toml`, so we can remove it from there. (Note that, in contrast to the `Cargo.toml` option, this target option also applies when we recompile the `core` library later in this post. So, even if you prefer to keep the `Cargo.toml` option, make sure to include this option.)
-
-```json
-  "disable-redzone": true,
-```
-
-We’re writing a kernel, so we’ll need to handle interrupts at some point. To do that safely, we have to disable a certain stack pointer optimization called the “red zone”, because it would cause stack corruption otherwise. For more information, see our separate post about [disabling the red zone](https://os.phil-opp.com/red-zone/).
-
-```json
-  "features": "-mmx,-sse,+soft-float",
-```
-
-The `features` field enables/disables target features. We disable the `mmx` and `sse` features by prefixing them with a minus and enable the `soft-float` feature by prefixing it with a plus. Note that there must be no spaces between different flags, otherwise LLVM fails to interpret the features string.
-
-The `mmx` and `sse` features determine support for Single Instruction Multiple Data (SIMD) instructions, which can often speed up programs significantly. However, using the large SIMD registers in OS kernels leads to performance problems. The reason is that the kernel needs to restore all registers to their original state before continuing an interrupted program. This means that the kernel has to save the complete SIMD state to main memory on each system call or hardware interrupt. Since the SIMD state is very large (512–1600 bytes) and interrupts can occur very often, these additional save/restore operations considerably harm performance. To avoid this, we disable SIMD for our kernel (not for applications running on top\!).
-
-A problem with disabling SIMD is that floating point operations on `x86_64` require SIMD registers by default. To solve this problem, we add the `soft-float` feature, which emulates all floating point operations through software functions based on normal integers.
-
-For more information, see our post on [disabling SIMD](https://os.phil-opp.com/disable-simd/).
-
-```json
-  "rustc-abi": "x86-softfloat"
-```
-
-As we want to use the `soft-float` feature, we also need to tell the Rust compiler `rustc` that we want to use the corresponding ABI. We can do that by setting the `rustc-abi` field to `x86-softfloat`.
-
-#### 🔗 Putting it Together
-
-Our target specification file now looks like this:
-
-```json
-{
-  "llvm-target": "x86_64-unknown-none",
-  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
-  "arch": "x86_64",
-  "target-endian": "little",
-  "target-pointer-width": "64",
-  "target-c-int-width": "32",
-  "os": "none",
-  "executables": true,
-  "linker-flavor": "ld.lld",
-  "linker": "rust-lld",
-  "panic-strategy": "abort",
-  "disable-redzone": true,
-  "features": "-mmx,-sse,+soft-float",
-  "rustc-abi": "x86-softfloat"
-}
-```
-
-### 🔗 Building our Kernel
-
-Compiling for our new target will use Linux conventions, since the `ld.lld` linker-flavor instructs llvm to compile with the `-flavor gnu` flag (for more linker options, see the [rustc documentation](https://www.google.com/search?q=https://doc.rust-lang.org/rustc/codegen-options/index.html%23linker-flavor)). This means that we need an entry point named `_start` as described in the previous post:
+First, we represent the different colors using an enum:
 
 ```rust
-// src/main.rs
+// in src/vga_buffer.rs
 
-#![no_std] // don't link the Rust standard library
-#![no_main] // disable all Rust-level entry points
-
-use core::panic::PanicInfo;
-
-/// This function is called on panic.
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Color {
+    Black = 0,
+    Blue = 1,
+    Green = 2,
+    Cyan = 3,
+    Red = 4,
+    Magenta = 5,
+    Brown = 6,
+    LightGray = 7,
+    DarkGray = 8,
+    LightBlue = 9,
+    LightGreen = 10,
+    LightCyan = 11,
+    LightRed = 12,
+    Pink = 13,
+    Yellow = 14,
+    White = 15,
 }
-
-#[no_mangle] // don't mangle the name of this function
-pub extern "C" fn _start() -> ! {
-    // this function is the entry point, since the linker looks for a function
-    // named `_start` by default
-    loop {}
-}
 ```
 
-Note that the entry point needs to be called `_start` regardless of your host OS.
+We use a C-like enum here to explicitly specify the number for each color. Because of the `repr(u8)` attribute, each enum variant is stored as a `u8`. Actually 4 bits would be sufficient, but Rust doesn’t have a `u4` type.
 
-We can now build the kernel for our new target by passing the name of the JSON file as `--target`:
+Normally the compiler would issue a warning for each unused variant. By using the `#[allow(dead_code)]` attribute, we disable these warnings for the `Color` enum.
 
-```bash
-> cargo build --target x86_64-blog_os.json
-```
+By deriving the `Copy`, `Clone`, `Debug`, `PartialEq`, and `Eq` traits, we enable copy semantics for the type and make it printable and comparable.
 
-```
-error[E0463]: can't find crate for `core`
-```
-
-It fails\! The error tells us that the Rust compiler no longer finds the `core` library. This library contains basic Rust types such as `Result`, `Option`, and iterators, and is implicitly linked to all `no_std` crates.
-
-The problem is that the `core` library is distributed together with the Rust compiler as a precompiled library. So it is only valid for supported host triples (e.g., `x86_64-unknown-linux-gnu`) but not for our custom target. If we want to compile code for other targets, we need to recompile `core` for these targets first.
-
-#### 🔗 The `build-std` Option
-
-That’s where the `build-std` feature of cargo comes in. It allows to recompile `core` and other standard library crates on demand, instead of using the precompiled versions shipped with the Rust installation. This feature is very new and still not finished, so it is marked as “unstable” and only available on nightly Rust compilers.
-
-To use the feature, we need to create a local cargo configuration file at `.cargo/config.toml` (the `.cargo` folder should be next to your `src` folder) with the following content:
-
-```toml
-# in .cargo/config.toml
-
-[unstable]
-build-std = ["core", "compiler_builtins"]
-```
-
-This tells cargo that it should recompile the `core` and `compiler_builtins` libraries. The latter is required because it is a dependency of `core`. In order to recompile these libraries, cargo needs access to the rust source code, which we can install with `rustup component add rust-src`.
-
-**Note:** The `unstable.build-std` configuration key requires at least the Rust nightly from 2020-07-15.
-
-After setting the `unstable.build-std` configuration key and installing the `rust-src` component, we can rerun our build command:
-
-```bash
-> cargo build --target x86_64-blog_os.json
-```
-
-```
-Compiling core v0.0.0 (/…/rust/src/libcore)
-Compiling rustc-std-workspace-core v1.99.0 (/…/rust/src/tools/rustc-std-workspace-core)
-Compiling compiler_builtins v0.1.32
-Compiling blog_os v0.1.0 (/…/blog_os)
-Finished dev [unoptimized + debuginfo] target(s) in 0.29 secs
-```
-
-We see that `cargo build` now recompiles the `core`, `rustc-std-workspace-core` (a dependency of `compiler_builtins`), and `compiler_builtins` libraries for our custom target.
-
-#### 🔗 Memory-Related Intrinsics
-
-The Rust compiler assumes that a certain set of built-in functions is available for all systems. Most of these functions are provided by the `compiler_builtins` crate that we just recompiled. However, there are some memory-related functions in that crate that are not enabled by default because they are normally provided by the C library on the system. These functions include `memset`, which sets all bytes in a memory block to a given value, `memcpy`, which copies one memory block to another, and `memcmp`, which compares two memory blocks. While we didn’t need any of these functions to compile our kernel right now, they will be required as soon as we add some more code to it (e.g. when copying structs around).
-
-Since we can’t link to the C library of the operating system, we need an alternative way to provide these functions to the compiler. One possible approach for this could be to implement our own `memset` etc. functions and apply the `#[no_mangle]` attribute to them (to avoid the automatic renaming during compilation). However, this is dangerous since the slightest mistake in the implementation of these functions could lead to undefined behavior. For example, implementing `memcpy` with a `for` loop may result in an infinite recursion because `for` loops implicitly call the `IntoIterator::into_iter` trait method, which may call `memcpy` again. So it’s a good idea to reuse existing, well-tested implementations instead.
-
-Fortunately, the `compiler_builtins` crate already contains implementations for all the needed functions, they are just disabled by default to not collide with the implementations from the C library. We can enable them by setting cargo’s `build-std-features` flag to `["compiler-builtins-mem"]`. Like the `build-std` flag, this flag can be either passed on the command line as a `-Z` flag or configured in the `unstable` table in the `.cargo/config.toml` file. Since we always want to build with this flag, the config file option makes more sense for us:
-
-```toml
-# in .cargo/config.toml
-
-[unstable]
-build-std-features = ["compiler-builtins-mem"]
-build-std = ["core", "compiler_builtins"]
-```
-
-(Support for the `compiler-builtins-mem` feature was only added very recently, so you need at least Rust nightly 2020-09-30 for it.)
-
-Behind the scenes, this flag enables the `mem` feature of the `compiler_builtins` crate. The effect of this is that the `#[no_mangle]` attribute is applied to the `memcpy` etc. implementations of the crate, which makes them available to the linker.
-
-With this change, our kernel has valid implementations for all compiler-required functions, so it will continue to compile even if our code gets more complex.
-
-#### 🔗 Set a Default Target
-
-To avoid passing the `--target` parameter on every invocation of `cargo build`, we can override the default target. To do this, we add the following to our cargo configuration file at `.cargo/config.toml`:
-
-```toml
-# in .cargo/config.toml
-
-[build]
-target = "x86_64-blog_os.json"
-```
-
-This tells `cargo` to use our `x86_64-blog_os.json` target when no explicit `--target` argument is passed. This means that we can now build our kernel with a simple `cargo build`. For more information on cargo configuration options, check out the [official documentation](https://doc.rust-lang.org/cargo/reference/config.html).
-
-We are now able to build our kernel for a bare metal target with a simple `cargo build`. However, our `_start` entry point, which will be called by the boot loader, is still empty. It’s time that we output something to screen from it.
-
-### 🔗 Printing to Screen
-
-The easiest way to print text to the screen at this stage is the VGA text buffer. It is a special memory area mapped to the VGA hardware that contains the contents displayed on screen. It normally consists of 25 lines that each contain 80 character cells. Each character cell displays an ASCII character with some foreground and background colors. The screen output looks like this:
-
-*screen output for common ASCII characters*
-
-We will discuss the exact layout of the VGA buffer in the next post, where we write a first small driver for it. For printing “Hello World\!”, we just need to know that the buffer is located at address `0xb8000` and that each character cell consists of an ASCII byte and a color byte.
-
-The implementation looks like this:
+To represent a full color code that specifies foreground and background color, we create a newtype on top of `u8`:
 
 ```rust
-static HELLO: &[u8] = b"Hello World!";
+// in src/vga_buffer.rs
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let vga_buffer = 0xb8000 as *mut u8;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+struct ColorCode(u8);
 
-    for (i, &byte) in HELLO.iter().enumerate() {
-        unsafe {
-            *vga_buffer.offset(i as isize * 2) = byte;
-            *vga_buffer.offset(i as isize * 2 + 1) = 0xb;
+impl ColorCode {
+    fn new(foreground: Color, background: Color) -> ColorCode {
+        ColorCode((background as u8) << 4 | (foreground as u8))
+    }
+}
+```
+
+The `ColorCode` struct contains the full color byte, containing foreground and background color. Like before, we derive the `Copy` and `Debug` traits for it. To ensure that the `ColorCode` has the exact same data layout as a `u8`, we use the `repr(transparent)` attribute.
+
+### Text Buffer
+
+Now we can add structures to represent a screen character and the text buffer:
+
+```rust
+// in src/vga_buffer.rs
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+struct ScreenChar {
+    ascii_character: u8,
+    color_code: ColorCode,
+}
+
+const BUFFER_HEIGHT: usize = 25;
+const BUFFER_WIDTH: usize = 80;
+
+#[repr(transparent)]
+struct Buffer {
+    chars: [[ScreenChar; BUFFER_WIDTH]; BUFFER_HEIGHT],
+}
+```
+
+Since the field ordering in default structs is undefined in Rust, we need the `repr(C)` attribute. It guarantees that the struct’s fields are laid out exactly like in a C struct and thus guarantees the correct field ordering. For the `Buffer` struct, we use `repr(transparent)` again to ensure that it has the same memory layout as its single field.
+
+To actually write to screen, we now create a writer type:
+
+```rust
+// in src/vga_buffer.rs
+
+pub struct Writer {
+    column_position: usize,
+    color_code: ColorCode,
+    buffer: &'static mut Buffer,
+}
+```
+
+The writer will always write to the last line and shift lines up when a line is full (or on `\n`). The `column_position` field keeps track of the current position in the last row. The current foreground and background colors are specified by `color_code` and a reference to the VGA buffer is stored in `buffer`. Note that we need an explicit lifetime here to tell the compiler how long the reference is valid. The `'static` lifetime specifies that the reference is valid for the whole program run time (which is true for the VGA text buffer).
+
+### Printing
+
+Now we can use the `Writer` to modify the buffer’s characters. First we create a method to write a single ASCII byte:
+
+```rust
+// in src/vga_buffer.rs
+
+impl Writer {
+    pub fn write_byte(&mut self, byte: u8) {
+        match byte {
+            b'\n' => self.new_line(),
+            byte => {
+                if self.column_position >= BUFFER_WIDTH {
+                    self.new_line();
+                }
+
+                let row = BUFFER_HEIGHT - 1;
+                let col = self.column_position;
+
+                let color_code = self.color_code;
+                self.buffer.chars[row][col] = ScreenChar {
+                    ascii_character: byte,
+                    color_code,
+                };
+                self.column_position += 1;
+            }
         }
     }
 
+    fn new_line(&mut self) {/* TODO */}
+}
+```
+
+If the byte is the newline byte `\n`, the writer does not print anything. Instead, it calls a `new_line` method, which we’ll implement later. Other bytes get printed to the screen in the second match case.
+
+When printing a byte, the writer checks if the current line is full. In that case, a `new_line` call is used to wrap the line. Then it writes a new `ScreenChar` to the buffer at the current position. Finally, the current column position is advanced.
+
+To print whole strings, we can convert them to bytes and print them one-by-one:
+
+```rust
+// in src/vga_buffer.rs
+
+impl Writer {
+    pub fn write_string(&mut self, s: &str) {
+        for byte in s.bytes() {
+            match byte {
+                // printable ASCII byte or newline
+                0x20..=0x7e | b'\n' => self.write_byte(byte),
+                // not part of printable ASCII range
+                _ => self.write_byte(0xfe),
+            }
+        }
+    }
+}
+```
+
+The VGA text buffer only supports ASCII and the additional bytes of code page 437. Rust strings are UTF-8 by default, so they might contain bytes that are not supported by the VGA text buffer. We use a `match` to differentiate printable ASCII bytes (a newline or anything in between a space character and a `~` character) and unprintable bytes. For unprintable bytes, we print a `■` character, which has the hex code `0xfe` on the VGA hardware.
+
+### Try it out\!
+
+To write some characters to the screen, you can create a temporary function:
+
+```rust
+// in src/vga_buffer.rs
+
+pub fn print_something() {
+    let mut writer = Writer {
+        column_position: 0,
+        color_code: ColorCode::new(Color::Yellow, Color::Black),
+        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+    };
+
+    writer.write_byte(b'H');
+    writer.write_string("ello ");
+    writer.write_string("Wörld!");
+}
+```
+
+It first creates a new `Writer` that points to the VGA buffer at `0xb8000`. The syntax for this might seem a bit strange: First, we cast the integer `0xb8000` as a mutable raw pointer. Then we convert it to a mutable reference by dereferencing it (through `*`) and immediately borrowing it again (through `&mut`). This conversion requires an `unsafe` block, since the compiler can’t guarantee that the raw pointer is valid.
+
+Then it writes the byte `b'H'` to it. The `b` prefix creates a byte literal, which represents an ASCII character. By writing the strings `"ello "` and `"Wörld!"`, we test our `write_string` method and the handling of unprintable characters. To see the output, we need to call the `print_something` function from our `_start` function:
+
+```rust
+// in src/main.rs
+
+#[unsafe(no_mangle)]
+pub extern "C" fn _start() -> ! {
+    vga_buffer::print_something();
+
     loop {}
 }
 ```
 
-First, we cast the integer `0xb8000` into a raw pointer. Then we iterate over the bytes of the static `HELLO` byte string. We use the `enumerate` method to additionally get a running variable `i`. In the body of the `for` loop, we use the `offset` method to write the string byte and the corresponding color byte (`0xb` is a light cyan).
+When we run our project now, a `Hello W■■rld!` should be printed in the lower left corner of the screen in yellow:
 
-Note that there’s an `unsafe` block around all memory writes. The reason is that the Rust compiler can’t prove that the raw pointers we create are valid. They could point anywhere and lead to data corruption. By putting them into an `unsafe` block, we’re basically telling the compiler that we are absolutely sure that the operations are valid. Note that an `unsafe` block does not turn off Rust’s safety checks. It only allows you to do [five additional things](https://www.google.com/search?q=https://doc.rust-lang.org/book/ch19-01-unsafe-rust.html%23unsafe-superpowers).
+*QEMU output with a yellow `Hello W■■rld!` in the lower left corner*
 
-I want to emphasize that this is not the way we want to do things in Rust\! It’s very easy to mess up when working with raw pointers inside `unsafe` blocks. For example, we could easily write beyond the buffer’s end if we’re not careful.
+Notice that the `ö` is printed as two `■` characters. That’s because `ö` is represented by two bytes in UTF-8, which both don’t fall into the printable ASCII range. In fact, this is a fundamental property of UTF-8: the individual bytes of multi-byte values are never valid ASCII.
 
-So we want to minimize the use of `unsafe` as much as possible. Rust gives us the ability to do this by creating safe abstractions. For example, we could create a VGA buffer type that encapsulates all unsafety and ensures that it is impossible to do anything wrong from the outside. This way, we would only need minimal amounts of `unsafe` code and can be sure that we don’t violate memory safety. We will create such a safe VGA buffer abstraction in the next post.
+## Volatile
 
-### 🔗 Running our Kernel
+We just saw that our message was printed correctly. However, it might not work with future Rust compilers that optimize more aggressively.
 
-Now that we have an executable that does something perceptible, it is time to run it. First, we need to turn our compiled kernel into a bootable disk image by linking it with a bootloader. Then we can run the disk image in the QEMU virtual machine or boot it on real hardware using a USB stick.
+The problem is that we only write to the `Buffer` and never read from it again. The compiler doesn’t know that we really access VGA buffer memory (instead of normal RAM) and knows nothing about the side effect that some characters appear on the screen. So it might decide that these writes are unnecessary and can be omitted. To avoid this erroneous optimization, we need to specify these writes as volatile. This tells the compiler that the write has side effects and should not be optimized away.
 
-#### 🔗 Creating a Bootimage
+In order to use volatile writes for the VGA buffer, we use the `volatile` library. This crate (this is how packages are called in the Rust world) provides a `Volatile` wrapper type with `read` and `write` methods. These methods internally use the `read_volatile` and `write_volatile` functions of the `core` library and thus guarantee that the reads/writes are not optimized away.
 
-To turn our compiled kernel into a bootable disk image, we need to link it with a bootloader. As we learned in the section about booting, the bootloader is responsible for initializing the CPU and loading our kernel.
-
-Instead of writing our own bootloader, which is a project on its own, we use the [`bootloader`](https://crates.io/crates/bootloader) crate. This crate implements a basic BIOS bootloader without any C dependencies, just Rust and inline assembly. To use it for booting our kernel, we need to add a dependency on it:
+We can add a dependency on the `volatile` crate by adding it to the `dependencies` section of our `Cargo.toml`:
 
 ```toml
 # in Cargo.toml
 
 [dependencies]
-bootloader = "0.9"
+volatile = "0.2.6"
 ```
 
-**Note:** This post is only compatible with `bootloader` v0.9. Newer versions use a different build system and will result in build errors when following this post.
+Make sure to specify volatile version `0.2.6`. Newer versions of the crate are not compatible with this post. `0.2.6` is the semantic version number. For more information, see the Specifying Dependencies guide of the cargo documentation.
 
-Adding the bootloader as a dependency is not enough to actually create a bootable disk image. The problem is that we need to link our kernel with the bootloader after compilation, but cargo has no support for post-build scripts.
+Let’s use it to make writes to the VGA buffer volatile. We update our `Buffer` type as follows:
 
-To solve this problem, we created a tool named `bootimage` that first compiles the kernel and bootloader, and then links them together to create a bootable disk image. To install the tool, go into your home directory (or any directory outside of your cargo project) and execute the following command in your terminal:
+```rust
+// in src/vga_buffer.rs
 
-```bash
-cargo install bootimage
+use volatile::Volatile;
+
+struct Buffer {
+    chars: [[Volatile<ScreenChar>; BUFFER_WIDTH]; BUFFER_HEIGHT],
+}
 ```
 
-For running `bootimage` and building the bootloader, you need to have the `llvm-tools-preview` rustup component installed. You can do so by executing `rustup component add llvm-tools-preview`.
+Instead of a `ScreenChar`, we’re now using a `Volatile<ScreenChar>`. (The `Volatile` type is generic and can wrap (almost) any type). This ensures that we can’t accidentally write to it “normally”. Instead, we have to use the `write` method now.
 
-After installing `bootimage` and adding the `llvm-tools-preview` component, you can create a bootable disk image by going back into your cargo project directory and executing:
+This means that we have to update our `Writer::write_byte` method:
 
-```bash
-> cargo bootimage
+```rust
+// in src/vga_buffer.rs
+
+impl Writer {
+    pub fn write_byte(&mut self, byte: u8) {
+        match byte {
+            b'\n' => self.new_line(),
+            byte => {
+                // ... (code to handle column_position and new_line)
+
+                let row = BUFFER_HEIGHT - 1; // Assuming row calculation is still needed
+                let col = self.column_position; // Assuming col calculation is still needed
+                let color_code = self.color_code; // Assuming color_code is still needed
+
+                self.buffer.chars[row][col].write(ScreenChar {
+                    ascii_character: byte,
+                    color_code,
+                });
+                // ... (code to update column_position)
+            }
+        }
+    }
+    // ...
+}
 ```
 
-We see that the tool recompiles our kernel using `cargo build`, so it will automatically pick up any changes you make. Afterwards, it compiles the bootloader, which might take a while. Like all crate dependencies, it is only built once and then cached, so subsequent builds will be much faster. Finally, `bootimage` combines the bootloader and your kernel into a bootable disk image.
+Instead of a typical assignment using `=`, we’re now using the `write` method. Now we can guarantee that the compiler will never optimize away this write.
 
-After executing the command, you should see a bootable disk image named `bootimage-blog_os.bin` in your `target/x86_64-blog_os/debug` directory. You can boot it in a virtual machine or copy it to a USB drive to boot it on real hardware. (Note that this is not a CD image, which has a different format, so burning it to a CD doesn’t work).
+## Formatting Macros
 
-#### 🔗 How does it work?
+It would be nice to support Rust’s formatting macros, too. That way, we can easily print different types, like integers or floats. To support them, we need to implement the `core::fmt::Write` trait. The only required method of this trait is `write_str`, which looks quite similar to our `write_string` method, just with a `fmt::Result` return type:
 
-The `bootimage` tool performs the following steps behind the scenes:
+```rust
+// in src/vga_buffer.rs
 
-1.  It compiles our kernel to an ELF file.
-2.  It compiles the bootloader dependency as a standalone executable.
-3.  It links the bytes of the kernel ELF file to the bootloader.
+use core::fmt;
 
-When booted, the bootloader reads and parses the appended ELF file. It then maps the program segments to virtual addresses in the page tables, zeroes the `.bss` section, and sets up a stack. Finally, it reads the entry point address (our `_start` function) and jumps to it.
-
-#### 🔗 Booting it in QEMU
-
-We can now boot the disk image in a virtual machine. To boot it in QEMU, execute the following command:
-
-```bash
-> qemu-system-x86_64 -drive format=raw,file=target/x86_64-blog_os/debug/bootimage-blog_os.bin
+impl fmt::Write for Writer {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.write_string(s);
+        Ok(())
+    }
+}
 ```
 
-This opens a separate window which should look similar to this:
+The `Ok(())` is just a `Ok` Result containing the `()` type.
 
-*QEMU showing “Hello World\!”*
+Now we can use Rust’s built-in `write!`/`writeln!` formatting macros:
 
-We see that our “Hello World\!” is visible on the screen.
+```rust
+// in src/vga_buffer.rs
 
-#### 🔗 Real Machine
+pub fn print_something() {
+    use core::fmt::Write;
+    let mut writer = Writer {
+        column_position: 0,
+        color_code: ColorCode::new(Color::Yellow, Color::Black),
+        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+    };
 
-It is also possible to write it to a USB stick and boot it on a real machine, but be careful to choose the correct device name, because everything on that device is overwritten:
-
-```bash
-> dd if=target/x86_64-blog_os/debug/bootimage-blog_os.bin of=/dev/sdX && sync
+    writer.write_byte(b'H');
+    writer.write_string("ello! ");
+    write!(writer, "The numbers are {} and {}", 42, 1.0/3.0).unwrap();
+}
 ```
 
-Where `sdX` is the device name of your USB stick.
+Now you should see a `Hello! The numbers are 42 and 0.3333333333333333` at the bottom of the screen. The `write!` call returns a `Result` which causes a warning if not used, so we call the `unwrap` function on it, which panics if an error occurs. This isn’t a problem in our case, since writes to the VGA buffer never fail.
 
-After writing the image to the USB stick, you can run it on real hardware by booting from it. You probably need to use a special boot menu or change the boot order in your BIOS configuration to boot from the USB stick. Note that it currently doesn’t work for UEFI machines, since the `bootloader` crate has no UEFI support yet.
+## Newlines
 
-#### 🔗 Using `cargo run`
+Right now, we just ignore newlines and characters that don’t fit into the line anymore. Instead, we want to move every character one line up (the top line gets deleted) and start at the beginning of the last line again. To do this, we add an implementation for the `new_line` method of `Writer`:
 
-To make it easier to run our kernel in QEMU, we can set the `runner` configuration key for cargo:
+```rust
+// in src/vga_buffer.rs
+
+impl Writer {
+    fn new_line(&mut self) {
+        for row in 1..BUFFER_HEIGHT {
+            for col in 0..BUFFER_WIDTH {
+                let character = self.buffer.chars[row][col].read();
+                self.buffer.chars[row - 1][col].write(character);
+            }
+        }
+        self.clear_row(BUFFER_HEIGHT - 1);
+        self.column_position = 0;
+    }
+
+    fn clear_row(&mut self, row: usize) {/* TODO */}
+}
+```
+
+We iterate over all the screen characters and move each character one row up. Note that the upper bound of the range notation (`..`) is exclusive. We also omit the 0th row (the first range starts at 1) because it’s the row that is shifted off screen.
+
+To finish the newline code, we add the `clear_row` method:
+
+```rust
+// in src/vga_buffer.rs
+
+impl Writer {
+    fn clear_row(&mut self, row: usize) {
+        let blank = ScreenChar {
+            ascii_character: b' ',
+            color_code: self.color_code,
+        };
+        for col in 0..BUFFER_WIDTH {
+            self.buffer.chars[row][col].write(blank);
+        }
+    }
+}
+```
+
+This method clears a row by overwriting all of its characters with a space character.
+
+## A Global Interface
+
+To provide a global writer that can be used as an interface from other modules without carrying a `Writer` instance around, we try to create a static `WRITER`:
+
+```rust
+// in src/vga_buffer.rs
+
+pub static WRITER: Writer = Writer {
+    column_position: 0,
+    color_code: ColorCode::new(Color::Yellow, Color::Black),
+    buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+};
+```
+
+However, if we try to compile it now, the following errors occur:
+
+```
+error[E0015]: calls in statics are limited to constant functions, tuple structs and tuple variants
+ --> src/vga_buffer.rs:7:17
+  |
+7 |     color_code: ColorCode::new(Color::Yellow, Color::Black),
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0396]: raw pointers cannot be dereferenced in statics
+ --> src/vga_buffer.rs:8:22
+  |
+8 |     buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+  |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ dereference of raw pointer in constant
+
+error[E0017]: references in statics may only refer to immutable values
+ --> src/vga_buffer.rs:8:22
+  |
+8 |     buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+  |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ statics require immutable values
+
+error[E0017]: references in statics may only refer to immutable values
+ --> src/vga_buffer.rs:8:13
+  |
+8 |     buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ statics require immutable values
+```
+
+To understand what’s happening here, we need to know that `static`s are initialized at compile time, in contrast to normal variables that are initialized at run time. The component of the Rust compiler that evaluates such initialization expressions is called the “const evaluator”. Its functionality is still limited, but there is ongoing work to expand it, for example in the “Allow panicking in constants” RFC.
+
+The issue with `ColorCode::new` would be solvable by using `const fn`s, but the fundamental problem here is that Rust’s const evaluator is not able to convert raw pointers to references at compile time. Maybe it will work someday, but until then, we have to find another solution.
+
+### Lazy Statics
+
+The one-time initialization of statics with non-const functions is a common problem in Rust. Fortunately, there already exists a good solution in a crate named `lazy_static`. This crate provides a `lazy_static!` macro that defines a lazily initialized static. Instead of computing its value at compile time, the static lazily initializes itself when accessed for the first time. Thus, the initialization happens at runtime, so arbitrarily complex initialization code is possible.
+
+Let’s add the `lazy_static` crate to our project:
 
 ```toml
-# in .cargo/config.toml
+# in Cargo.toml
 
-[target.'cfg(target_os = "none")']
-runner = "bootimage runner"
+[dependencies.lazy_static]
+version = "1.0"
+features = ["spin_no_std"]
 ```
 
-The `target.'cfg(target_os = "none")'` table applies to all targets whose target configuration file’s `"os"` field is set to `"none"`. This includes our `x86_64-blog_os.json` target. The `runner` key specifies the command that should be invoked for `cargo run`. The command is run after a successful build with the executable path passed as the first argument. See the [cargo documentation for more details](https://www.google.com/search?q=https://doc.rust-lang.org/cargo/reference/config.html%23targettriplecomman).
+We need the `spin_no_std` feature, since we don’t link the standard library.
 
-The `bootimage runner` command is specifically designed to be usable as a `runner` executable. It links the given executable with the project’s bootloader dependency and then launches QEMU. See the [Readme of `bootimage` for more details and possible configuration options](https://www.google.com/search?q=https://github.com/rust-osdev/bootimage%23usage).
+With `lazy_static`, we can define our static `WRITER` without problems:
 
-Now we can use `cargo run` to compile our kernel and boot it in QEMU.
+```rust
+// in src/vga_buffer.rs
 
-## 🔗 What’s next?
+use lazy_static::lazy_static;
 
-In the next post, we will explore the VGA text buffer in more detail and write a safe interface for it. We will also add support for the `println` macro.
+lazy_static! {
+    pub static ref WRITER: Writer = Writer {
+        column_position: 0,
+        color_code: ColorCode::new(Color::Yellow, Color::Black),
+        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+    };
+}
+```
 
------
+However, this `WRITER` is pretty useless since it is immutable. This means that we can’t write anything to it (since all the write methods take `&mut self`). One possible solution would be to use a `static mut`. But then every read and write to it would be `unsafe` since it could easily introduce data races and other bad things. Using `static mut` is highly discouraged. There were even proposals to remove it. But what are the alternatives? We could try to use an immutable static with a cell type like `RefCell` or even `UnsafeCell` that provides interior mutability. But these types aren’t `Sync` (with good reason), so we can’t use them in statics.
 
-**Support Me**
+### Spinlocks
 
-Creating and maintaining this blog and the associated libraries is a lot of work, but I really enjoy doing it. By supporting me, you allow me to invest more time in new content, new features, and continuous maintenance. The best way to support me is to [sponsor me on GitHub](https://github.com/sponsors/phil-opp). Thank you\!
+To get synchronized interior mutability, users of the standard library can use `Mutex`. It provides mutual exclusion by blocking threads when the resource is already locked. But our basic kernel does not have any blocking support or even a concept of threads, so we can’t use it either. However, there is a really basic kind of mutex in computer science that requires no operating system features: the spinlock. Instead of blocking, the threads simply try to lock it again and again in a tight loop, thus burning CPU time until the mutex is free again.
+
+To use a spinning mutex, we can add the `spin` crate as a dependency:
+
+```toml
+# in Cargo.toml
+[dependencies]
+spin = "0.5.2"
+```
+
+Then we can use the spinning mutex to add safe interior mutability to our static `WRITER`:
+
+```rust
+// in src/vga_buffer.rs
+
+use spin::Mutex;
+// ... (other use statements)
+
+lazy_static! {
+    pub static ref WRITER: Mutex<Writer> = Mutex::new(Writer {
+        column_position: 0,
+        color_code: ColorCode::new(Color::Yellow, Color::Black),
+        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+    });
+}
+```
+
+Now we can delete the `print_something` function and print directly from our `_start` function:
+
+```rust
+// in src/main.rs
+#[unsafe(no_mangle)]
+pub extern "C" fn _start() -> ! {
+    use core::fmt::Write;
+    vga_buffer::WRITER.lock().write_str("Hello again").unwrap();
+    write!(vga_buffer::WRITER.lock(), ", some numbers: {} {}", 42, 1.337).unwrap();
+
+    loop {}
+}
+```
+
+We need to import the `fmt::Write` trait in order to be able to use its functions.
+
+## Safety
+
+Note that we only have a single `unsafe` block in our code, which is needed to create a `Buffer` reference pointing to `0xb8000`. Afterwards, all operations are safe. Rust uses bounds checking for array accesses by default, so we can’t accidentally write outside the buffer. Thus, we encoded the required conditions in the type system and are able to provide a safe interface to the outside.
+
+## A println Macro
+
+Now that we have a global writer, we can add a `println` macro that can be used from anywhere in the codebase. Rust’s macro syntax is a bit strange, so we won’t try to write a macro from scratch. Instead, we look at the source of the `println!` macro in the standard library:
+
+```rust
+#[macro_export]
+macro_rules! println {
+    () => (print!("\n"));
+    ($($arg:tt)*) => (print!("{}\n", format_args!($($arg)*)));
+}
+```
+
+Macros are defined through one or more rules, similar to `match` arms. The `println` macro has two rules: The first rule is for invocations without arguments, e.g., `println!()`, which is expanded to `print!("\n")` and thus just prints a newline. The second rule is for invocations with parameters such as `println!("Hello")` or `println!("Number: {}", 4)`. It is also expanded to an invocation of the `print!` macro, passing all arguments and an additional newline `\n` at the end.
+
+The `#[macro_export]` attribute makes the macro available to the whole crate (not just the module it is defined in) and external crates. It also places the macro at the crate root, which means we have to import the macro through `use std::println` instead of `std::macros::println`.
+
+The `print!` macro is defined as:
+
+```rust
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => ($crate::io::_print(format_args!($($arg)*)));
+}
+```
+
+The macro expands to a call of the `_print` function in the `io` module. The `$crate` variable ensures that the macro also works from outside the `std` crate by expanding to `std` when it’s used in other crates.
+
+The `format_args` macro builds a `fmt::Arguments` type from the passed arguments, which is passed to `_print`. The `_print` function of `libstd` calls `print_to`, which is rather complicated because it supports different `Stdout` devices. We don’t need that complexity since we just want to print to the VGA buffer.
+
+To print to the VGA buffer, we just copy the `println!` and `print!` macros, but modify them to use our own `_print` function:
+
+```rust
+// in src/vga_buffer.rs
+
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => ($crate::vga_buffer::_print(format_args!($($arg)*)));
+}
+
+#[macro_export]
+macro_rules! println {
+    () => ($crate::print!("\n"));
+    ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+}
+
+#[doc(hidden)]
+pub fn _print(args: fmt::Arguments) {
+    use core::fmt::Write;
+    WRITER.lock().write_fmt(args).unwrap();
+}
+```
+
+One thing that we changed from the original `println` definition is that we prefixed the invocations of the `print!` macro with `$crate` too. This ensures that we don’t need to import the `print!` macro too if we only want to use `println`.
+
+Like in the standard library, we add the `#[macro_export]` attribute to both macros to make them available everywhere in our crate. Note that this places the macros in the root namespace of the crate, so importing them via `use crate::vga_buffer::println` does not work. Instead, we have to do `use crate::println`.
+
+The `_print` function locks our static `WRITER` and calls the `write_fmt` method on it. This method is from the `Write` trait, which we need to import. The additional `unwrap()` at the end panics if printing isn’t successful. But since we always return `Ok` in `write_str`, that should not happen.
+
+Since the macros need to be able to call `_print` from outside of the module, the function needs to be public. However, since we consider this a private implementation detail, we add the `doc(hidden)` attribute to hide it from the generated documentation.
+
+### Hello World using println
+
+Now we can use `println` in our `_start` function:
+
+```rust
+// in src/main.rs
+
+#[unsafe(no_mangle)]
+pub extern "C" fn _start() -> ! {
+    println!("Hello World{}", "!");
+
+    loop {}
+}
+```
+
+Note that we don’t have to import the macro in the main function, because it already lives in the root namespace.
+
+As expected, we now see a “Hello World\!” on the screen:
+
+*QEMU printing “Hello World\!”*
+
+### Printing Panic Messages
+
+Now that we have a `println` macro, we can use it in our panic function to print the panic message and the location of the panic:
+
+```rust
+// in main.rs
+
+/// This function is called on panic.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! { // Added core::panic:: for clarity
+    println!("{}", info);
+    loop {}
+}
+```
+
+When we now insert `panic!("Some panic message");` in our `_start` function, we get the following output:
+
+```
+panicked at 'Some panic message', src/main.rs:28:5
+```
+
+So we know not only that a panic has occurred, but also the panic message and where in the code it happened.
+
+## Summary
+
+In this post, we learned about the structure of the VGA text buffer and how it can be written through the memory mapping at address `0xb8000`. We created a Rust module that encapsulates the unsafety of writing to this memory-mapped buffer and presents a safe and convenient interface to the outside.
+
+Thanks to cargo, we also saw how easy it is to add dependencies on third-party libraries. The two dependencies that we added, `lazy_static` and `spin`, are very useful in OS development and we will use them in more places in future posts.
+
+## What’s next?
+
+The next post explains how to set up Rust’s built-in unit test framework. We will then create some basic unit tests for the VGA buffer module from this post.
 
 ```
