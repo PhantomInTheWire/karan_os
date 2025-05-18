@@ -1,8 +1,8 @@
-use volatile::Volatile;
 use core::fmt;
 use core::fmt::Write;
 use lazy_static::lazy_static;
 use spin::Mutex;
+use volatile::Volatile;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +111,6 @@ impl Writer {
             }
         }
     }
-
 }
 
 impl Write for Writer {
@@ -122,7 +121,7 @@ impl Write for Writer {
 }
 
 lazy_static! {
-    pub static ref  WRITER: Mutex<Writer> = Mutex::new(Writer {
+    pub static ref WRITER: Mutex<Writer> = Mutex::new(Writer {
         column_position: 0,
         color_code: ColorCode::new(Color::Yellow, Color::Black),
         buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
@@ -145,7 +144,6 @@ pub fn _print(args: fmt::Arguments) {
     WRITER.lock().write_fmt(args).unwrap();
 }
 
-
 #[test_case]
 fn test_println_simple() {
     println!("test_println_simple output");
@@ -167,4 +165,3 @@ fn test_println_output() {
         assert_eq!(char::from(screen_char.ascii_character), c);
     }
 }
-

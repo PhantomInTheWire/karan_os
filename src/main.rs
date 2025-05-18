@@ -4,8 +4,8 @@
 #![test_runner(karanos::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
-use karanos::println;
 use core::panic::PanicInfo;
+use karanos::println;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
