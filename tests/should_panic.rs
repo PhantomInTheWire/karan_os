@@ -2,7 +2,7 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-use karanos::{exit_qemu, serial_print, serial_println, QemuExitCode};
+use karanos::{QemuExitCode, exit_qemu, serial_print, serial_println};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
