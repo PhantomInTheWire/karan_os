@@ -23,8 +23,17 @@ jobs:
           rustup component add rust-src --toolchain nightly
           rustup default nightly
 
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+
+      - name: Set up cargo runner config
+        run: |
+          mkdir -p .cargo
+          echo '[target.x86_64-karanos]' > .cargo/config.toml
+          echo 'runner = "qemu-system-x86_64 -drive format=raw,file={}"' >> .cargo/config.toml
+
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --verbose --target x86_64-karanos.json
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --verbose --target x86_64-karanos.json
